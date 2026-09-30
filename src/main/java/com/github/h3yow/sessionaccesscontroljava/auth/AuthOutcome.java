@@ -11,5 +11,9 @@ public enum AuthOutcome {
     SESSION_REVOKED,
     REFRESH_TOKEN_REUSED,
     REVOKE_SUCCESS,
-    REVOKE_NOT_FOUND
+    REVOKE_NOT_FOUND,
+    /** 刷新时会话已因闲置超时自动失效（区别于 REFRESH_TOKEN_EXPIRED 绝对过期）。 */
+    SESSION_IDLE_TIMEOUT,
+    /** 刷新时会话已因超出容量上限被淘汰。 */
+    SESSION_EVICTED
 }

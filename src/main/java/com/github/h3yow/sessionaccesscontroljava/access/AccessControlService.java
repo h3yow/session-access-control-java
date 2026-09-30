@@ -10,8 +10,10 @@ import com.github.h3yow.sessionaccesscontroljava.session.SessionRepository;
 import com.github.h3yow.sessionaccesscontroljava.session.SessionState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -37,24 +39,27 @@ public class AccessControlService {
 
     /** 角色到权限的显式映射：角色不隐式放行任何资源，只展开为明确权限。 */
     private static final Map<String, Set<String>> ROLE_PERMISSIONS = Map.of(
-            "ROLE_USER", Set.of("profile:read"),
-            "ROLE_ADMIN", Set.of("profile:read", "admin:read"),
-            "ROLE_FINANCE", Set.of("profile:read", "finance:read")
+            "ROLE_USER", Set.of("profile:read", "session:manage"),
+            "ROLE_ADMIN", Set.of("profile:read", "admin:read", "session:manage"),
+            "ROLE_FINANCE", Set.of("profile:read", "finance:read", "session:manage")
     );
 
     private final SessionRepository sessionRepository;
     private final UserDirectory userDirectory;
     private final TickClock clock;
     private final AuditService auditService;
+    private final Duration idleTimeout;
 
     public AccessControlService(SessionRepository sessionRepository,
                                 UserDirectory userDirectory,
                                 TickClock clock,
-                                AuditService auditService) {
+                                AuditService auditService,
+                                @Value("${auth.session.idle-timeout:PT30M}") Duration idleTimeout) {
         this.sessionRepository = sessionRepository;
         this.userDirectory = userDirectory;
         this.clock = clock;
         this.auditService = auditService;
+        this.idleTimeout = idleTimeout;
     }
 
     public AccessDecision decide(String accessToken, String requiredPermission) {
@@ -80,9 +85,41 @@ public class AccessControlService {
         }
 
         Optional<SessionChain> chainOpt = sessionRepository.findById(record.getSessionId());
-        if (chainOpt.isEmpty() || chainOpt.get().getState() == SessionState.REVOKED) {
+        if (chainOpt.isEmpty()) {
             return deny(record.getUsername(), AccessDeniedReason.SESSION_REVOKED,
-                    "session not active sessionId=" + record.getSessionId());
+                    "session not found sessionId=" + record.getSessionId());
+        }
+        SessionChain chain = chainOpt.get();
+
+        // 会话终态判定：主动撤销 / 闲置超时 / 容量淘汰 / 刷新凭证绝对过期，原因彼此可区分。
+        // 先在会话监视器内做一次闲置懒收敛（访问也算活动，但只有仍存活时才推进活动时间）。
+        SessionState state;
+        synchronized (chain) {
+            state = sessionRepository.evaluateIdle(chain, clock.now(), idleTimeout);
+        }
+        switch (state) {
+            case REVOKED -> {
+                return deny(record.getUsername(), AccessDeniedReason.SESSION_REVOKED,
+                        "session revoked sessionId=" + record.getSessionId());
+            }
+            case IDLE_TIMEOUT -> {
+                return deny(record.getUsername(), AccessDeniedReason.SESSION_IDLE_TIMEOUT,
+                        "session idle-timed-out at lastActivityAt=" + chain.getLastActivityAt()
+                                + " sessionId=" + record.getSessionId());
+            }
+            case EVICTED -> {
+                return deny(record.getUsername(), AccessDeniedReason.SESSION_EVICTED,
+                        "session evicted by capacity limit sessionId=" + record.getSessionId());
+            }
+            case EXPIRED -> {
+                return deny(record.getUsername(), AccessDeniedReason.SESSION_EXPIRED,
+                        "session refresh credential reached absolute expiry at "
+                                + chain.getRefreshTokenExpiresAt()
+                                + " sessionId=" + record.getSessionId());
+            }
+            case ACTIVE -> {
+                // 继续后续权限判定
+            }
         }
 
         // 默认拒绝：调用方必须显式声明所需权限
@@ -104,6 +141,8 @@ public class AccessControlService {
                             + " permissions=" + user.permissions());
         }
 
+        // 访问即活动：仅在凭证与权限全部通过后推进最近活动时间
+        sessionRepository.touchActivity(chain, clock.now());
         log.info("access-granted username={} sessionId={} permission={}",
                 user.username(), record.getSessionId(), requiredPermission);
         auditService.record("ACCESS", user.username(), "ALLOWED",

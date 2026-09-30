@@ -12,14 +12,19 @@ public class SessionChain {
     private final String username;
     private volatile String currentRefreshToken;
     private final Instant refreshTokenExpiresAt;
+    private final Instant createdAt;
+    private volatile Instant lastActivityAt;
     private volatile SessionState state;
 
     public SessionChain(String sessionId, String username, String currentRefreshToken,
-                        Instant refreshTokenExpiresAt, SessionState state) {
+                        Instant refreshTokenExpiresAt, Instant createdAt,
+                        Instant lastActivityAt, SessionState state) {
         this.sessionId = sessionId;
         this.username = username;
         this.currentRefreshToken = currentRefreshToken;
         this.refreshTokenExpiresAt = refreshTokenExpiresAt;
+        this.createdAt = createdAt;
+        this.lastActivityAt = lastActivityAt;
         this.state = state;
     }
 
@@ -28,6 +33,9 @@ public class SessionChain {
     public String getCurrentRefreshToken() { return currentRefreshToken; }
     public void setCurrentRefreshToken(String token) { this.currentRefreshToken = token; }
     public Instant getRefreshTokenExpiresAt() { return refreshTokenExpiresAt; }
+    public Instant getCreatedAt() { return createdAt; }
+    public Instant getLastActivityAt() { return lastActivityAt; }
+    public void setLastActivityAt(Instant at) { this.lastActivityAt = at; }
     public SessionState getState() { return state; }
     public void setState(SessionState state) { this.state = state; }
 }

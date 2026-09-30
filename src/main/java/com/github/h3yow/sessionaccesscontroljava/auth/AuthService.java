@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -41,6 +42,8 @@ public class AuthService {
 
     private final Duration accessTtl;
     private final Duration refreshTtl;
+    private final Duration idleTimeout;
+    private final int maxSessionsPerUser;
 
     public AuthService(SessionRepository sessionRepository,
                        UserDirectory userDirectory,
@@ -50,7 +53,9 @@ public class AuthService {
                        TickClock clock,
                        AuditService auditService,
                        @Value("${auth.token.access-ttl:PT15M}") Duration accessTtl,
-                       @Value("${auth.token.refresh-ttl:PT12H}") Duration refreshTtl) {
+                       @Value("${auth.token.refresh-ttl:PT12H}") Duration refreshTtl,
+                       @Value("${auth.session.idle-timeout:PT30M}") Duration idleTimeout,
+                       @Value("${auth.session.max-per-user:5}") int maxSessionsPerUser) {
         this.sessionRepository = sessionRepository;
         this.userDirectory = userDirectory;
         this.passwordHasher = passwordHasher;
@@ -60,6 +65,8 @@ public class AuthService {
         this.auditService = auditService;
         this.accessTtl = accessTtl;
         this.refreshTtl = refreshTtl;
+        this.idleTimeout = idleTimeout;
+        this.maxSessionsPerUser = maxSessionsPerUser;
     }
 
     /** 登录：校验锁定状态与口令，成功则签发一条新会话链与凭证对。 */
@@ -115,50 +122,86 @@ public class AuthService {
         }
 
         SessionChain chain = chainOpt.get();
-        synchronized (chain) {
-            if (chain.getState() == SessionState.REVOKED) {
-                log.warn("refresh-denied sessionId={} username={} reason=SESSION_REVOKED",
-                        chain.getSessionId(), chain.getUsername());
-                auditService.record("REFRESH", chain.getUsername(), "SESSION_REVOKED",
-                        "sessionId=" + chain.getSessionId());
-                return AuthResult.failure(AuthOutcome.SESSION_REVOKED, "session has been revoked");
-            }
-            if (clock.now().isAfter(chain.getRefreshTokenExpiresAt())) {
-                log.warn("refresh-denied sessionId={} username={} reason=REFRESH_TOKEN_EXPIRED expiredAt={}",
-                        chain.getSessionId(), chain.getUsername(), chain.getRefreshTokenExpiresAt());
-                auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_EXPIRED",
-                        "sessionId=" + chain.getSessionId());
-                return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_EXPIRED, "refresh token has expired");
-            }
-            // 关键判定：提交的凭证不等于链上当前凭证 => 旧凭证被重复使用
-            if (!refreshToken.equals(chain.getCurrentRefreshToken())) {
-                sessionRepository.revoke(chain);
-                log.warn("refresh-reuse-detected sessionId={} username={} presentedPrefix={} currentPrefix={} -> chain revoked",
-                        chain.getSessionId(), chain.getUsername(), prefix(refreshToken),
-                        prefix(chain.getCurrentRefreshToken()));
-                auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_REUSED",
-                        "old refresh token reused; session chain invalidated sessionId=" + chain.getSessionId());
-                return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_REUSED,
-                        "old refresh token reused; the whole session chain has been invalidated");
-            }
+        // 固定加锁顺序：先用户锁后会话锁（与登录建档/淘汰一致），杜绝死锁与容量竞争误算
+        synchronized (sessionRepository.userLock(chain.getUsername())) {
+            synchronized (chain) {
+                SessionState state = chain.getState();
+                if (state == SessionState.REVOKED) {
+                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_REVOKED",
+                            chain.getSessionId(), chain.getUsername());
+                    auditService.record("REFRESH", chain.getUsername(), "SESSION_REVOKED",
+                            "sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.SESSION_REVOKED, "session has been revoked");
+                }
+                if (state == SessionState.IDLE_TIMEOUT) {
+                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_IDLE_TIMEOUT lastActivityAt={}",
+                            chain.getSessionId(), chain.getUsername(), chain.getLastActivityAt());
+                    auditService.record("REFRESH", chain.getUsername(), "SESSION_IDLE_TIMEOUT",
+                            "idle timeout sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.SESSION_IDLE_TIMEOUT,
+                            "session has timed out due to inactivity");
+                }
+                if (state == SessionState.EVICTED) {
+                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_EVICTED",
+                            chain.getSessionId(), chain.getUsername());
+                    auditService.record("REFRESH", chain.getUsername(), "SESSION_EVICTED",
+                            "evicted by capacity limit sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.SESSION_EVICTED,
+                            "session was evicted due to the active session capacity limit");
+                }
 
-            String newRefresh = tokenIssuer.issueToken();
-            boolean rotated = sessionRepository.rotateRefreshToken(chain, refreshToken, newRefresh);
-            if (!rotated) {
-                // 理论上在同一监视器内不会发生；保守处理为复用，使状态收敛
-                sessionRepository.revoke(chain);
-                auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_REUSED",
-                        "rotation race resolved as reuse sessionId=" + chain.getSessionId());
-                return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_REUSED,
-                        "refresh token reuse suspected; session chain invalidated");
-            }
+                Instant now = clock.now();
+                // 绝对过期优先：刷新凭证的绝对到期与闲置失效必须可区分
+                if (!now.isBefore(chain.getRefreshTokenExpiresAt())) {
+                    chain.setState(SessionState.EXPIRED);
+                    log.warn("refresh-denied sessionId={} username={} reason=REFRESH_TOKEN_EXPIRED expiredAt={}",
+                            chain.getSessionId(), chain.getUsername(), chain.getRefreshTokenExpiresAt());
+                    auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_EXPIRED",
+                            "absolute expiry sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_EXPIRED, "refresh token has expired");
+                }
+                // 闲置治理：一段时间无访问也无刷新 -> 自动失效（区别于绝对过期）
+                if (sessionRepository.evaluateIdle(chain, now, idleTimeout) == SessionState.IDLE_TIMEOUT) {
+                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_IDLE_TIMEOUT lastActivityAt={} idleTimeout={}",
+                            chain.getSessionId(), chain.getUsername(), chain.getLastActivityAt(), idleTimeout);
+                    auditService.record("REFRESH", chain.getUsername(), "SESSION_IDLE_TIMEOUT",
+                            "idle timeout on refresh sessionId=" + chain.getSessionId()
+                                    + " lastActivityAt=" + chain.getLastActivityAt());
+                    return AuthResult.failure(AuthOutcome.SESSION_IDLE_TIMEOUT,
+                            "session has timed out due to inactivity");
+                }
+                // 关键判定：提交的凭证不等于链上当前凭证 => 旧凭证被重复使用
+                if (!refreshToken.equals(chain.getCurrentRefreshToken())) {
+                    sessionRepository.revoke(chain);
+                    log.warn("refresh-reuse-detected sessionId={} username={} presentedPrefix={} currentPrefix={} -> chain revoked",
+                            chain.getSessionId(), chain.getUsername(), prefix(refreshToken),
+                            prefix(chain.getCurrentRefreshToken()));
+                    auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_REUSED",
+                            "old refresh token reused; session chain invalidated sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_REUSED,
+                            "old refresh token reused; the whole session chain has been invalidated");
+                }
 
-            TokenPair tokens = issueTokensForChain(chain);
-            log.info("refresh-success sessionId={} username={} rotatedPrefix={}->{}",
-                    chain.getSessionId(), chain.getUsername(), prefix(refreshToken), prefix(newRefresh));
-            auditService.record("REFRESH", chain.getUsername(), "REFRESH_SUCCESS",
-                    "token rotated sessionId=" + chain.getSessionId());
-            return AuthResult.success(AuthOutcome.REFRESH_SUCCESS, tokens, "token pair rotated");
+                String newRefresh = tokenIssuer.issueToken();
+                boolean rotated = sessionRepository.rotateRefreshToken(chain, refreshToken, newRefresh);
+                if (!rotated) {
+                    // 理论上在同一监视器内不会发生；保守处理为复用，使状态收敛
+                    sessionRepository.revoke(chain);
+                    auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_REUSED",
+                            "rotation race resolved as reuse sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_REUSED,
+                            "refresh token reuse suspected; session chain invalidated");
+                }
+                // 刷新即活动：推进最近活动时间
+                sessionRepository.touchActivity(chain, now);
+
+                TokenPair tokens = issueTokensForChain(chain);
+                log.info("refresh-success sessionId={} username={} rotatedPrefix={}->{}",
+                        chain.getSessionId(), chain.getUsername(), prefix(refreshToken), prefix(newRefresh));
+                auditService.record("REFRESH", chain.getUsername(), "REFRESH_SUCCESS",
+                        "token rotated sessionId=" + chain.getSessionId());
+                return AuthResult.success(AuthOutcome.REFRESH_SUCCESS, tokens, "token pair rotated");
+            }
         }
     }
 
@@ -187,8 +230,20 @@ public class AuthService {
         String sessionId = UUID.randomUUID().toString();
         String refreshToken = tokenIssuer.issueToken();
         SessionChain chain = new SessionChain(
-                sessionId, username, refreshToken, now.plus(refreshTtl), SessionState.ACTIVE);
-        sessionRepository.create(chain);
+                sessionId, username, refreshToken, now.plus(refreshTtl), now, now, SessionState.ACTIVE);
+        // 用户级监视器内建档 + 容量治理：计数、闲置收敛、淘汰与同用户并发刷新互不算错
+        synchronized (sessionRepository.userLock(username)) {
+            sessionRepository.create(chain);
+            List<SessionChain> evicted = sessionRepository.evictOverflow(
+                    username, now, idleTimeout, maxSessionsPerUser, sessionId);
+            for (SessionChain victim : evicted) {
+                log.warn("session-evicted username={} evictedSessionId={} lastActivityAt={} reason=capacity limit={}",
+                        username, victim.getSessionId(), victim.getLastActivityAt(), maxSessionsPerUser);
+                auditService.record("SESSION", username, "SESSION_EVICTED",
+                        "capacity overflow; sessionId=" + victim.getSessionId()
+                                + " lastActivityAt=" + victim.getLastActivityAt());
+            }
+        }
         return issueTokensForChain(chain);
     }
 

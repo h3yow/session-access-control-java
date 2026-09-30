@@ -87,7 +87,8 @@ public class AuthorizationInterceptor implements HandlerInterceptor {
     private HttpStatus mapStatus(AccessDeniedReason reason) {
         return switch (reason) {
             case MISSING_CREDENTIAL, UNKNOWN_TOKEN -> HttpStatus.UNAUTHORIZED;
-            case TOKEN_EXPIRED, TOKEN_REVOKED, SESSION_REVOKED -> HttpStatus.UNAUTHORIZED;
+            case TOKEN_EXPIRED, TOKEN_REVOKED, SESSION_REVOKED,
+                    SESSION_IDLE_TIMEOUT, SESSION_EVICTED, SESSION_EXPIRED -> HttpStatus.UNAUTHORIZED;
             case INSUFFICIENT_PERMISSION -> HttpStatus.FORBIDDEN;
         };
     }

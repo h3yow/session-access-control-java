@@ -7,6 +7,7 @@ import com.github.h3yow.sessionaccesscontroljava.auth.PasswordHasher;
 import com.github.h3yow.sessionaccesscontroljava.auth.AppUser;
 import com.github.h3yow.sessionaccesscontroljava.auth.UserDirectory;
 import com.github.h3yow.sessionaccesscontroljava.access.AccessControlService;
+import com.github.h3yow.sessionaccesscontroljava.governance.SessionGovernanceService;
 import com.github.h3yow.sessionaccesscontroljava.session.SessionRepository;
 import com.github.h3yow.sessionaccesscontroljava.token.TokenIssuer;
 
@@ -19,6 +20,10 @@ public final class TestFixtures {
 
     public static final Duration ACCESS_TTL = Duration.ofMinutes(15);
     public static final Duration REFRESH_TTL = Duration.ofHours(12);
+    /** 测试默认闲置超时：30 分钟无访问/刷新即自动失效。 */
+    public static final Duration IDLE_TIMEOUT = Duration.ofMinutes(30);
+    /** 测试默认单用户活跃会话容量上限。 */
+    public static final int MAX_SESSIONS_PER_USER = 5;
 
     private TestFixtures() {
     }
@@ -27,12 +32,17 @@ public final class TestFixtures {
             MutableTickClock clock,
             AuthService authService,
             AccessControlService accessControlService,
+            SessionGovernanceService governanceService,
             SessionRepository sessionRepository,
             UserDirectory userDirectory,
             AuditService auditService) {
     }
 
     public static Harness newHarness() {
+        return newHarness(IDLE_TIMEOUT, MAX_SESSIONS_PER_USER);
+    }
+
+    public static Harness newHarness(Duration idleTimeout, int maxSessionsPerUser) {
         MutableTickClock clock = new MutableTickClock(Instant.parse("2026-09-23T00:00:00Z"));
         SessionRepository sessionRepository = new SessionRepository();
         UserDirectory userDirectory = new UserDirectory();
@@ -47,10 +57,13 @@ public final class TestFixtures {
         TokenIssuer tokenIssuer = new TokenIssuer();
         AuditService auditService = new AuditService(clock);
         AuthService authService = new AuthService(sessionRepository, userDirectory, passwordHasher,
-                failureTracker, tokenIssuer, clock, auditService, ACCESS_TTL, REFRESH_TTL);
+                failureTracker, tokenIssuer, clock, auditService, ACCESS_TTL, REFRESH_TTL,
+                idleTimeout, maxSessionsPerUser);
         AccessControlService accessControlService =
-                new AccessControlService(sessionRepository, userDirectory, clock, auditService);
-        return new Harness(clock, authService, accessControlService, sessionRepository,
+                new AccessControlService(sessionRepository, userDirectory, clock, auditService, idleTimeout);
+        SessionGovernanceService governanceService =
+                new SessionGovernanceService(sessionRepository, clock, auditService, idleTimeout, maxSessionsPerUser);
+        return new Harness(clock, authService, accessControlService, governanceService, sessionRepository,
                 userDirectory, auditService);
     }
 }
