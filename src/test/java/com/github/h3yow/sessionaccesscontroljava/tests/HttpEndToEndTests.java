@@ -120,7 +120,8 @@ class HttpEndToEndTests {
         log.info("HTTP unknown-refresh: reason={}", json(unknownRefresh).get("reason").asText());
 
         // 连续 5 次失败 -> 423 LOCKED + ACCOUNT_LOCKED
-        String bobBad = "{\"username\":\"bob\",\"password\":\"wrong\"}";
+        // 专用用户名（不存在），避免与其他 @SpringBootTest 类共享上下文时的锁定状态串扰
+        String bobBad = "{\"username\":\"lockme-http-e2e\",\"password\":\"wrong\"}";
         for (int i = 0; i < 4; i++) {
             mockMvc.perform(post("/api/auth/login")
                     .contentType(MediaType.APPLICATION_JSON).content(bobBad))

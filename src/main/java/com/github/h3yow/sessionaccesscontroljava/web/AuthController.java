@@ -68,7 +68,8 @@ public class AuthController {
             case ACCOUNT_LOCKED -> ResponseEntity.status(HttpStatus.LOCKED).body(body);
             case REFRESH_TOKEN_UNKNOWN -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
             case REFRESH_TOKEN_EXPIRED -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
-            case SESSION_REVOKED -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
+            case SESSION_REVOKED, SESSION_IDLE, SESSION_EVICTED ->
+                    ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
             case REFRESH_TOKEN_REUSED -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
             case REVOKE_NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
         };
