@@ -27,10 +27,13 @@ import java.util.Set;
  * 1. 凭证是否携带        -> MISSING_CREDENTIAL
  * 2. 凭证是否可识别      -> UNKNOWN_TOKEN
  * 3. 凭证是否已撤销      -> TOKEN_REVOKED
- * 4. 凭证是否已过期      -> TOKEN_EXPIRED
- * 5. 会话链是否存活      -> SESSION_REVOKED
+ * 4. 凭证是否已过期      -> TOKEN_EXPIRED（短期访问凭证自身自然到期）
+ * 5. 会话链生命周期      -> SESSION_REVOKED / SESSION_EXPIRED（长期凭证绝对到期）/
+ *                          SESSION_IDLE_TIMEOUT / SESSION_EVICTED
  * 6. 是否显式声明所需权限（默认拒绝）
  * 7. 用户角色/权限是否满足 -> INSUFFICIENT_PERMISSION
+ * 注意：会话绝对过期不级联撤销访问凭证，因此第 4 步与第 5 步的原因始终可区分：
+ * 访问凭证自身到期 -> TOKEN_EXPIRED；会话长期凭证到点（即使访问凭证表面未到期）-> SESSION_EXPIRED。
  */
 @Service
 public class AccessControlService {
@@ -91,63 +94,67 @@ public class AccessControlService {
         }
         SessionChain chain = chainOpt.get();
 
-        // 会话终态判定：主动撤销 / 闲置超时 / 容量淘汰 / 刷新凭证绝对过期，原因彼此可区分。
-        // 先在会话监视器内做一次闲置懒收敛（访问也算活动，但只有仍存活时才推进活动时间）。
-        SessionState state;
-        synchronized (chain) {
-            state = sessionRepository.evaluateIdle(chain, clock.now(), idleTimeout);
-        }
-        switch (state) {
-            case REVOKED -> {
-                return deny(record.getUsername(), AccessDeniedReason.SESSION_REVOKED,
-                        "session revoked sessionId=" + record.getSessionId());
-            }
-            case IDLE_TIMEOUT -> {
-                return deny(record.getUsername(), AccessDeniedReason.SESSION_IDLE_TIMEOUT,
-                        "session idle-timed-out at lastActivityAt=" + chain.getLastActivityAt()
-                                + " sessionId=" + record.getSessionId());
-            }
-            case EVICTED -> {
-                return deny(record.getUsername(), AccessDeniedReason.SESSION_EVICTED,
-                        "session evicted by capacity limit sessionId=" + record.getSessionId());
-            }
-            case EXPIRED -> {
-                return deny(record.getUsername(), AccessDeniedReason.SESSION_EXPIRED,
-                        "session refresh credential reached absolute expiry at "
-                                + chain.getRefreshTokenExpiresAt()
-                                + " sessionId=" + record.getSessionId());
-            }
-            case ACTIVE -> {
-                // 继续后续权限判定
-            }
-        }
+        // 会话终态判定在 user -> chain 固定加锁顺序下完成（与刷新、名单、容量治理一致）：
+        // 同一用户的"名单收敛 / 访问判定 / 刷新轮换 / 撤销 / 淘汰"互斥，
+        // 因此在绝对到期点前后并发时，不会出现名单显示存活而访问已拒绝的矛盾。
+        // 生命周期懒收敛同时覆盖绝对过期与闲置，且绝对过期优先于闲置。
+        synchronized (sessionRepository.userLock(chain.getUsername())) {
+            synchronized (chain) {
+                SessionState state = sessionRepository.evaluateLifecycle(chain, clock.now(), idleTimeout);
+                switch (state) {
+                    case REVOKED -> {
+                        return deny(record.getUsername(), AccessDeniedReason.SESSION_REVOKED,
+                                "session revoked sessionId=" + record.getSessionId());
+                    }
+                    case IDLE_TIMEOUT -> {
+                        return deny(record.getUsername(), AccessDeniedReason.SESSION_IDLE_TIMEOUT,
+                                "session idle-timed-out at lastActivityAt=" + chain.getLastActivityAt()
+                                        + " sessionId=" + record.getSessionId());
+                    }
+                    case EVICTED -> {
+                        return deny(record.getUsername(), AccessDeniedReason.SESSION_EVICTED,
+                                "session evicted by capacity limit sessionId=" + record.getSessionId());
+                    }
+                    case EXPIRED -> {
+                        return deny(record.getUsername(), AccessDeniedReason.SESSION_EXPIRED,
+                                "session refresh credential reached absolute expiry at "
+                                        + chain.getRefreshTokenExpiresAt()
+                                        + " sessionId=" + record.getSessionId());
+                    }
+                    case ACTIVE -> {
+                        // 继续后续权限判定（仍持有链监视器，期间任何终态流转都被阻塞）
+                    }
+                }
 
-        // 默认拒绝：调用方必须显式声明所需权限
-        if (requiredPermission == null || requiredPermission.isBlank()) {
-            return deny(record.getUsername(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
-                    "no required permission declared; default-deny sessionId=" + record.getSessionId());
-        }
+                // 默认拒绝：调用方必须显式声明所需权限
+                if (requiredPermission == null || requiredPermission.isBlank()) {
+                    return deny(record.getUsername(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
+                            "no required permission declared; default-deny sessionId=" + record.getSessionId());
+                }
 
-        Optional<AppUser> userOpt = userDirectory.findByUsername(record.getUsername());
-        if (userOpt.isEmpty()) {
-            return deny(record.getUsername(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
-                    "principal no longer exists; default-deny");
-        }
-        AppUser user = userOpt.get();
-        Set<String> effective = effectivePermissions(user);
-        if (!effective.contains(requiredPermission)) {
-            return deny(user.username(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
-                    "permission '" + requiredPermission + "' not held; roles=" + user.roles()
-                            + " permissions=" + user.permissions());
-        }
+                Optional<AppUser> userOpt = userDirectory.findByUsername(record.getUsername());
+                if (userOpt.isEmpty()) {
+                    return deny(record.getUsername(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
+                            "principal no longer exists; default-deny");
+                }
+                AppUser user = userOpt.get();
+                Set<String> effective = effectivePermissions(user);
+                if (!effective.contains(requiredPermission)) {
+                    return deny(user.username(), AccessDeniedReason.INSUFFICIENT_PERMISSION,
+                            "permission '" + requiredPermission + "' not held; roles=" + user.roles()
+                                    + " permissions=" + user.permissions());
+                }
 
-        // 访问即活动：仅在凭证与权限全部通过后推进最近活动时间
-        sessionRepository.touchActivity(chain, clock.now());
-        log.info("access-granted username={} sessionId={} permission={}",
-                user.username(), record.getSessionId(), requiredPermission);
-        auditService.record("ACCESS", user.username(), "ALLOWED",
-                "permission=" + requiredPermission + " sessionId=" + record.getSessionId());
-        return AccessDecision.allow(user.username(), record.getSessionId());
+                // 访问即活动：仅在凭证与权限全部通过、且会话仍为 ACTIVE 时推进最近活动时间。
+                // 绝对过期/终态会话绝不可能走到这里，故不存在"请求把失效会话重新用活"的路径。
+                sessionRepository.touchActivity(chain, clock.now());
+                log.info("access-granted username={} sessionId={} permission={}",
+                        user.username(), record.getSessionId(), requiredPermission);
+                auditService.record("ACCESS", user.username(), "ALLOWED",
+                        "permission=" + requiredPermission + " sessionId=" + record.getSessionId());
+                return AccessDecision.allow(user.username(), record.getSessionId());
+            }
+        }
     }
 
     private AccessDecision deny(String subject, AccessDeniedReason reason, String detail) {

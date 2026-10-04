@@ -90,24 +90,35 @@ public class SessionRepository {
     }
 
     /**
-     * 闲置判定：会话处于 ACTIVE 且最近活动时间距 now 超过 idleTimeout，则收敛为 IDLE_TIMEOUT。
-     * 必须在持有会话监视器时调用（或由调用方在外层持有用户锁后进入会话锁）。
-     * 返回流转后的状态。
+     * 生命周期懒收敛：在会话监视器内把 ACTIVE 会话按当前时间收敛为唯一终态。
+     * 判定优先级（互斥、只可能进入一个终态）：
+     * 1. 绝对过期：now &gt;= refreshTokenExpiresAt（长期登录凭证到点，与闲置窗口无关）-> EXPIRED；
+     * 2. 闲置超时：距 lastActivityAt 超过 idleTimeout -> IDLE_TIMEOUT。
+     * 绝对过期优先于闲置，保证"绝对有效期先到、闲置窗口还没到"时原因唯一为 EXPIRED。
+     * 已是终态的会话原样返回（终态不可被重新激活、不可被覆盖）。
+     * 必须在持有会话监视器时调用。返回收敛后的状态。
      */
-    public SessionState evaluateIdle(SessionChain chain, Instant now, Duration idleTimeout) {
+    public SessionState evaluateLifecycle(SessionChain chain, Instant now, Duration idleTimeout) {
         synchronized (chain) {
-            if (chain.getState() == SessionState.ACTIVE
-                    && !chain.getLastActivityAt().plus(idleTimeout).isAfter(now)) {
-                chain.setState(SessionState.IDLE_TIMEOUT);
+            if (chain.getState() == SessionState.ACTIVE) {
+                if (!now.isBefore(chain.getRefreshTokenExpiresAt())) {
+                    chain.setState(SessionState.EXPIRED);
+                } else if (!chain.getLastActivityAt().plus(idleTimeout).isAfter(now)) {
+                    chain.setState(SessionState.IDLE_TIMEOUT);
+                }
             }
             return chain.getState();
         }
     }
 
-    /** 在用户锁内把该用户所有已闲置的 ACTIVE 会话一次性收敛为 IDLE_TIMEOUT。 */
-    public void transitionIdleSessions(String username, Instant now, Duration idleTimeout) {
+    /**
+     * 在用户锁内把该用户所有已到点的 ACTIVE 会话一次性收敛：
+     * 绝对过期 -> EXPIRED；否则满足闲置窗口 -> IDLE_TIMEOUT。
+     * 名单/容量治理调用本方法，保证"存活"集合与访问、刷新判定看到同一条规则。
+     */
+    public void transitionTimedOutSessions(String username, Instant now, Duration idleTimeout) {
         for (SessionChain chain : sessionsOfUser(username)) {
-            evaluateIdle(chain, now, idleTimeout);
+            evaluateLifecycle(chain, now, idleTimeout);
         }
     }
 
@@ -122,15 +133,16 @@ public class SessionRepository {
 
     /**
      * 容量治理（调用方必须持有该用户的用户锁）：
-     * 先收敛闲置会话，再统计 ACTIVE；若数量超过上限，把最久未活动的会话淘汰为 EVICTED，
-     * 直到回到上限以内。protectedSessionId（通常是本次刚登录的新会话）永不被淘汰。
+     * 先收敛已到点（绝对过期/闲置超时）的会话，再统计 ACTIVE；若数量超过上限，
+     * 把最久未活动的会话淘汰为 EVICTED，直到回到上限以内。
+     * protectedSessionId（通常是本次刚登录的新会话）永不被淘汰。
      * 淘汰选择以 (lastActivityAt, sessionId) 全序排序，结果稳定确定。
      * 返回被淘汰的会话列表。
      */
     public List<SessionChain> evictOverflow(String username, Instant now, Duration idleTimeout,
                                             int maxSessionsPerUser, String protectedSessionId) {
         List<SessionChain> evicted = new ArrayList<>();
-        transitionIdleSessions(username, now, idleTimeout);
+        transitionTimedOutSessions(username, now, idleTimeout);
 
         List<SessionChain> active = sessionsOfUser(username).stream()
                 .filter(c -> c.getState() == SessionState.ACTIVE)

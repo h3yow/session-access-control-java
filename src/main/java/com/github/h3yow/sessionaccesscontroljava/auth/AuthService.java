@@ -125,50 +125,46 @@ public class AuthService {
         // 固定加锁顺序：先用户锁后会话锁（与登录建档/淘汰一致），杜绝死锁与容量竞争误算
         synchronized (sessionRepository.userLock(chain.getUsername())) {
             synchronized (chain) {
-                SessionState state = chain.getState();
-                if (state == SessionState.REVOKED) {
-                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_REVOKED",
-                            chain.getSessionId(), chain.getUsername());
-                    auditService.record("REFRESH", chain.getUsername(), "SESSION_REVOKED",
-                            "sessionId=" + chain.getSessionId());
-                    return AuthResult.failure(AuthOutcome.SESSION_REVOKED, "session has been revoked");
-                }
-                if (state == SessionState.IDLE_TIMEOUT) {
-                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_IDLE_TIMEOUT lastActivityAt={}",
-                            chain.getSessionId(), chain.getUsername(), chain.getLastActivityAt());
-                    auditService.record("REFRESH", chain.getUsername(), "SESSION_IDLE_TIMEOUT",
-                            "idle timeout sessionId=" + chain.getSessionId());
-                    return AuthResult.failure(AuthOutcome.SESSION_IDLE_TIMEOUT,
-                            "session has timed out due to inactivity");
-                }
-                if (state == SessionState.EVICTED) {
-                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_EVICTED",
-                            chain.getSessionId(), chain.getUsername());
-                    auditService.record("REFRESH", chain.getUsername(), "SESSION_EVICTED",
-                            "evicted by capacity limit sessionId=" + chain.getSessionId());
-                    return AuthResult.failure(AuthOutcome.SESSION_EVICTED,
-                            "session was evicted due to the active session capacity limit");
-                }
-
                 Instant now = clock.now();
-                // 绝对过期优先：刷新凭证的绝对到期与闲置失效必须可区分
-                if (!now.isBefore(chain.getRefreshTokenExpiresAt())) {
-                    chain.setState(SessionState.EXPIRED);
-                    log.warn("refresh-denied sessionId={} username={} reason=REFRESH_TOKEN_EXPIRED expiredAt={}",
-                            chain.getSessionId(), chain.getUsername(), chain.getRefreshTokenExpiresAt());
-                    auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_EXPIRED",
-                            "absolute expiry sessionId=" + chain.getSessionId());
-                    return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_EXPIRED, "refresh token has expired");
-                }
-                // 闲置治理：一段时间无访问也无刷新 -> 自动失效（区别于绝对过期）
-                if (sessionRepository.evaluateIdle(chain, now, idleTimeout) == SessionState.IDLE_TIMEOUT) {
-                    log.warn("refresh-denied sessionId={} username={} reason=SESSION_IDLE_TIMEOUT lastActivityAt={} idleTimeout={}",
-                            chain.getSessionId(), chain.getUsername(), chain.getLastActivityAt(), idleTimeout);
-                    auditService.record("REFRESH", chain.getUsername(), "SESSION_IDLE_TIMEOUT",
-                            "idle timeout on refresh sessionId=" + chain.getSessionId()
-                                    + " lastActivityAt=" + chain.getLastActivityAt());
-                    return AuthResult.failure(AuthOutcome.SESSION_IDLE_TIMEOUT,
-                            "session has timed out due to inactivity");
+                // 生命周期懒收敛（与访问、名单同一套规则，绝对过期优先于闲置）：
+                // 终态会话一律拒绝，且每种终态映射到可区分的 outcome；只有 ACTIVE 才可能继续。
+                SessionState lifecycle = sessionRepository.evaluateLifecycle(chain, now, idleTimeout);
+                switch (lifecycle) {
+                    case EXPIRED -> {
+                        log.warn("refresh-denied sessionId={} username={} reason=REFRESH_TOKEN_EXPIRED expiredAt={}",
+                                chain.getSessionId(), chain.getUsername(), chain.getRefreshTokenExpiresAt());
+                        auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_EXPIRED",
+                                "absolute expiry sessionId=" + chain.getSessionId());
+                        return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_EXPIRED,
+                                "refresh token has expired");
+                    }
+                    case IDLE_TIMEOUT -> {
+                        log.warn("refresh-denied sessionId={} username={} reason=SESSION_IDLE_TIMEOUT lastActivityAt={} idleTimeout={}",
+                                chain.getSessionId(), chain.getUsername(), chain.getLastActivityAt(), idleTimeout);
+                        auditService.record("REFRESH", chain.getUsername(), "SESSION_IDLE_TIMEOUT",
+                                "idle timeout on refresh sessionId=" + chain.getSessionId()
+                                        + " lastActivityAt=" + chain.getLastActivityAt());
+                        return AuthResult.failure(AuthOutcome.SESSION_IDLE_TIMEOUT,
+                                "session has timed out due to inactivity");
+                    }
+                    case REVOKED -> {
+                        log.warn("refresh-denied sessionId={} username={} reason=SESSION_REVOKED",
+                                chain.getSessionId(), chain.getUsername());
+                        auditService.record("REFRESH", chain.getUsername(), "SESSION_REVOKED",
+                                "sessionId=" + chain.getSessionId());
+                        return AuthResult.failure(AuthOutcome.SESSION_REVOKED, "session has been revoked");
+                    }
+                    case EVICTED -> {
+                        log.warn("refresh-denied sessionId={} username={} reason=SESSION_EVICTED",
+                                chain.getSessionId(), chain.getUsername());
+                        auditService.record("REFRESH", chain.getUsername(), "SESSION_EVICTED",
+                                "evicted by capacity limit sessionId=" + chain.getSessionId());
+                        return AuthResult.failure(AuthOutcome.SESSION_EVICTED,
+                                "session was evicted due to the active session capacity limit");
+                    }
+                    case ACTIVE -> {
+                        // 继续后续复用判定与轮换
+                    }
                 }
                 // 关键判定：提交的凭证不等于链上当前凭证 => 旧凭证被重复使用
                 if (!refreshToken.equals(chain.getCurrentRefreshToken())) {

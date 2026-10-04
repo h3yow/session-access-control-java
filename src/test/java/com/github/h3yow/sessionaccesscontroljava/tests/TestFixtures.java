@@ -43,6 +43,16 @@ public final class TestFixtures {
     }
 
     public static Harness newHarness(Duration idleTimeout, int maxSessionsPerUser) {
+        return newHarness(ACCESS_TTL, REFRESH_TTL, idleTimeout, maxSessionsPerUser);
+    }
+
+    /**
+     * 构造一套与生产一致的组件，但四个时间/容量参数全部可控：
+     * 绝对过期专项用例用它把 accessTtl 调到接近 refreshTtl 或 idleTimeout，
+     * 从而精确复现"绝对有效期先到、访问凭证表面未到期、闲置窗口还没到"等组合。
+     */
+    public static Harness newHarness(Duration accessTtl, Duration refreshTtl,
+                                     Duration idleTimeout, int maxSessionsPerUser) {
         MutableTickClock clock = new MutableTickClock(Instant.parse("2026-09-23T00:00:00Z"));
         SessionRepository sessionRepository = new SessionRepository();
         UserDirectory userDirectory = new UserDirectory();
@@ -57,7 +67,7 @@ public final class TestFixtures {
         TokenIssuer tokenIssuer = new TokenIssuer();
         AuditService auditService = new AuditService(clock);
         AuthService authService = new AuthService(sessionRepository, userDirectory, passwordHasher,
-                failureTracker, tokenIssuer, clock, auditService, ACCESS_TTL, REFRESH_TTL,
+                failureTracker, tokenIssuer, clock, auditService, accessTtl, refreshTtl,
                 idleTimeout, maxSessionsPerUser);
         AccessControlService accessControlService =
                 new AccessControlService(sessionRepository, userDirectory, clock, auditService, idleTimeout);
