@@ -104,10 +104,51 @@ public class SessionRepository {
         }
     }
 
+    /**
+     * 绝对过期判定：会话处于 ACTIVE 且刷新凭证的绝对到期时间已到（now >= refreshTokenExpiresAt），
+     * 则收敛为 EXPIRED 终态。与闲置相互独立：即使刚刚还有活动，绝对到期一到即失效。
+     * 必须在持有会话监视器时调用。返回流转后的状态。
+     */
+    public SessionState evaluateAbsoluteExpiry(SessionChain chain, Instant now) {
+        synchronized (chain) {
+            if (chain.getState() == SessionState.ACTIVE
+                    && !now.isBefore(chain.getRefreshTokenExpiresAt())) {
+                chain.setState(SessionState.EXPIRED);
+            }
+            return chain.getState();
+        }
+    }
+
+    /**
+     * 存活判定（单次加锁内原子完成）：先绝对过期、后闲置。
+     * 绝对过期优先于闲置，保证"已绝对过期但闲置窗口未到"的会话收敛为 EXPIRED 而非 IDLE_TIMEOUT，
+     * 使名单、访问、刷新三个入口在同一时刻看到同一个唯一状态。
+     */
+    public SessionState evaluateLiveness(SessionChain chain, Instant now, Duration idleTimeout) {
+        synchronized (chain) {
+            if (chain.getState() == SessionState.ACTIVE
+                    && !now.isBefore(chain.getRefreshTokenExpiresAt())) {
+                chain.setState(SessionState.EXPIRED);
+            }
+            if (chain.getState() == SessionState.ACTIVE
+                    && !chain.getLastActivityAt().plus(idleTimeout).isAfter(now)) {
+                chain.setState(SessionState.IDLE_TIMEOUT);
+            }
+            return chain.getState();
+        }
+    }
+
     /** 在用户锁内把该用户所有已闲置的 ACTIVE 会话一次性收敛为 IDLE_TIMEOUT。 */
     public void transitionIdleSessions(String username, Instant now, Duration idleTimeout) {
         for (SessionChain chain : sessionsOfUser(username)) {
             evaluateIdle(chain, now, idleTimeout);
+        }
+    }
+
+    /** 在用户锁内把该用户所有已绝对过期的 ACTIVE 会话一次性收敛为 EXPIRED。 */
+    public void transitionExpiredSessions(String username, Instant now) {
+        for (SessionChain chain : sessionsOfUser(username)) {
+            evaluateAbsoluteExpiry(chain, now);
         }
     }
 
@@ -130,6 +171,8 @@ public class SessionRepository {
     public List<SessionChain> evictOverflow(String username, Instant now, Duration idleTimeout,
                                             int maxSessionsPerUser, String protectedSessionId) {
         List<SessionChain> evicted = new ArrayList<>();
+        // 先收敛绝对过期、再收敛闲置：已失效会话不占活跃容量
+        transitionExpiredSessions(username, now);
         transitionIdleSessions(username, now, idleTimeout);
 
         List<SessionChain> active = sessionsOfUser(username).stream()

@@ -92,10 +92,12 @@ public class AccessControlService {
         SessionChain chain = chainOpt.get();
 
         // 会话终态判定：主动撤销 / 闲置超时 / 容量淘汰 / 刷新凭证绝对过期，原因彼此可区分。
-        // 先在会话监视器内做一次闲置懒收敛（访问也算活动，但只有仍存活时才推进活动时间）。
+        // 在会话监视器内原子做"绝对过期优先、闲置其次"的懒收敛：
+        // 即使访问凭证本身尚未自然到期，只要会话已绝对过期，也必须在此拒绝（SESSION_EXPIRED），
+        // 且与名单、刷新入口在同一时刻看到同一个唯一状态。
         SessionState state;
         synchronized (chain) {
-            state = sessionRepository.evaluateIdle(chain, clock.now(), idleTimeout);
+            state = sessionRepository.evaluateLiveness(chain, clock.now(), idleTimeout);
         }
         switch (state) {
             case REVOKED -> {

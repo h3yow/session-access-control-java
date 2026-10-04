@@ -56,7 +56,9 @@ public class SessionGovernanceService {
         }
         List<SessionView> views = new ArrayList<>();
         synchronized (sessionRepository.userLock(callerUsername)) {
-            // 列表前先做闲置收敛，保证返回的"存活"集合与后续访问判定一致
+            // 列表前先做绝对过期 + 闲置收敛（与访问判定同一套懒收敛语义），
+            // 保证返回的"存活"集合与访问/刷新判定一致：已绝对过期的会话绝不出现在名单中
+            sessionRepository.transitionExpiredSessions(callerUsername, clock.now());
             sessionRepository.transitionIdleSessions(callerUsername, clock.now(), idleTimeout);
             List<SessionChain> chains = sessionRepository.sessionsOfUser(callerUsername).stream()
                     .filter(c -> c.getState() == SessionState.ACTIVE)
@@ -138,6 +140,7 @@ public class SessionGovernanceService {
         int count = 0;
         List<String> revokedIds = new ArrayList<>();
         synchronized (sessionRepository.userLock(callerUsername)) {
+            sessionRepository.transitionExpiredSessions(callerUsername, clock.now());
             sessionRepository.transitionIdleSessions(callerUsername, clock.now(), idleTimeout);
             for (SessionChain chain : sessionRepository.sessionsOfUser(callerUsername)) {
                 if (chain.getSessionId().equals(currentSessionId)) {

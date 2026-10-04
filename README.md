@@ -13,7 +13,7 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（30 个，含并发刷新/复用检测/过期/撤销/权限/会话治理/HTTP 端到端）
+# 运行全部测试（37 个，含并发刷新/复用检测/过期/撤销/权限/会话治理/绝对过期/HTTP 端到端）
 mvn test
 
 # 启动本地服务（默认 8080 端口）
@@ -86,10 +86,22 @@ curl -s -X DELETE http://localhost:8080/api/sessions/others \
 ```properties
 # src/main/resources/application.properties
 auth.token.access-ttl=PT15M      # 短期访问凭证有效期
-auth.token.refresh-ttl=PT12H     # 长期刷新凭证有效期
+auth.token.refresh-ttl=PT12H     # 长期刷新凭证有效期（会话绝对有效期，锚定登录时刻）
 auth.login.max-failures=5        # 连续失败锁定阈值
 auth.login.lock-duration=PT5M    # 锁定时长
 ```
+
+本地验证"绝对过期"语义（推荐用可控时钟的自动化测试，稳定可复现）：
+
+```bash
+# 只跑绝对过期用例，日志中可见每个 CASE 的场景、判定原因与通过情况
+mvn test -Dtest=AbsoluteExpiryTests
+```
+
+手动验证：把 `auth.token.refresh-ttl` 调短（如 `PT2M`）、`auth.session.idle-timeout`
+保持较大（如 `PT30M`）后重启，登录拿到凭证对，期间持续访问保持活跃；2 分钟后：
+`GET /api/sessions` 名单中该会话消失、携带未自然到期的 access 凭证访问返回
+401 `SESSION_EXPIRED`、刷新返回 401 `REFRESH_TOKEN_EXPIRED`，且之后任何请求都无法复活该会话。
 
 ---
 
@@ -142,22 +154,38 @@ auth.login.lock-duration=PT5M    # 锁定时长
 | `REVOKED` | 被**主动撤销**（用户踢设备 / 撤销接口 / 检测到刷新凭证复用） | 主动操作或复用检测 |
 | `IDLE_TIMEOUT` | **闲置超时**：一段时间内既无访问也无刷新，自动失效 | 懒判定（访问/刷新/列举/淘汰时） |
 | `EVICTED` | **容量淘汰**：同一用户活跃会话超过上限，最久未活动者被淘汰 | 每次新登录建档后 |
-| `EXPIRED` | 刷新凭证到达**绝对过期时间**（与闲置相互独立） | 刷新时判定 |
+| `EXPIRED` | 刷新凭证到达**绝对过期时间**（与闲置相互独立） | 懒判定（访问/刷新/列举/淘汰时） |
 
 关键区分：**闲置失效 ≠ 凭证绝对过期**。
 
 - 闲置看的是"距上次活动多久"（`now - lastActivityAt > idle-timeout`），只要持续在用就不会闲置；
-- 绝对过期看的是"距登录多久"（`now > refreshTokenExpiresAt`，锚定登录时刻，刷新不延长）。
+- 绝对过期看的是"距登录多久"（`now >= refreshTokenExpiresAt`，锚定登录时刻，刷新不延长）。
 
-### 2.5.1 会话列举与归属隔离
+### 2.5.1 绝对过期的可见语义（名单 / 访问 / 刷新一致失效）
 
-- `GET /api/sessions` 仅返回**调用者本人**名下仍为 `ACTIVE` 的会话；列举前先做一次闲置收敛，
-  保证"存活集合"与随后的访问判定一致。
+当一条会话的刷新凭证已过绝对有效期、但闲置窗口还没到（刚还有活动）时：
+
+- **名单**：`GET /api/sessions` 在列举前先做"绝对过期 + 闲置"懒收敛，已绝对过期的会话
+  **不会出现在存活名单中**，也不会被任何入口当作可继续使用的会话；
+- **访问**：即使该会话此前签发的 access 凭证表面上还没自然到期，访问一律拒绝，
+  原因为 `SESSION_EXPIRED`（HTTP 401）——与 `TOKEN_EXPIRED`（access 凭证自身到期）、
+  `SESSION_IDLE_TIMEOUT`（闲置）、`SESSION_REVOKED`（主动撤销/复用）、
+  `SESSION_EVICTED`（容量淘汰）彼此可区分；
+- **刷新**：一律拒绝，原因为 `REFRESH_TOKEN_EXPIRED`；
+- **终态不可逆**：一旦收敛为 `EXPIRED`，后续任何请求（访问/刷新/列举/再次撤销）
+  都不能把它重新变回可用；绝对过期判定与闲置判定在**同一把会话锁内原子完成**
+  （绝对过期优先），名单、访问、刷新三个入口在同一时刻看到同一个唯一状态，
+  并发下最终状态唯一收敛，不会重新出现有效的会话链。
+
+### 2.5.2 会话列举与归属隔离
+
+- `GET /api/sessions` 仅返回**调用者本人**名下仍为 `ACTIVE` 的会话；列举前先做一次
+  **绝对过期 + 闲置**收敛，保证"存活集合"与随后的访问/刷新判定一致。
 - 每条返回 `sessionId / createdAt / lastActivityAt / current`，其中 `current` 标识
   "发起本次查询的这条会话"。**响应中绝不出现任何 access/refresh 凭证内容**。
 - 归属边界来自当前访问凭证解析出的用户，而非请求参数；天然不可能列举到他人会话。
 
-### 2.5.2 精确撤销与"撤销其它"
+### 2.5.3 精确撤销与"撤销其它"
 
 - `POST /api/sessions/revoke` 按 `sessionId` 精确撤销：会话进入 `REVOKED` 并**级联撤销该会话全部
   访问凭证**，因此撤销后该设备的下一次访问与刷新**立即被拒**，无需等待自然过期。
@@ -165,7 +193,7 @@ auth.login.lock-duration=PT5M    # 锁定时长
 - 对已经处于终态的会话再次撤销是**幂等**的（返回成功并在消息中注明既有终态）；终态不会被覆盖、
   不会被"重新激活"。
 
-### 2.5.3 各类拒绝原因的区别
+### 2.5.4 各类拒绝原因的区别
 
 访问被拒（`AccessDeniedReason`，HTTP 401/403）：
 
@@ -187,7 +215,7 @@ auth.login.lock-duration=PT5M    # 锁定时长
 会话治理写操作（`GovernanceOutcome`）：`SESSION_REVOKED` / `SESSIONS_REVOKED_OTHERS`（200）、
 `SESSION_NOT_FOUND`（404）、`SESSION_FORBIDDEN`（**越权操作他人会话，403**）。
 
-### 2.5.4 容量与并发语义
+### 2.5.5 容量与并发语义
 
 - **每用户一把用户级监视器**。登录"建档 + 闲置收敛 + 容量淘汰"在同一把锁内原子完成；
   刷新按固定加锁顺序 **先用户锁、后会话锁**（与登录一致，不会死锁），
@@ -198,8 +226,9 @@ auth.login.lock-duration=PT5M    # 锁定时长
 - 所有状态流转只能 `ACTIVE -> 某个唯一终态`（`transitionIfActive` 单向 CAS）。
   多个请求并发撤销/刷新/淘汰同一条会话时，先到的终态胜出且不被覆盖，**最终状态唯一收敛，
   绝不会出现两条同时有效的链**。
-- 闲置判定为**懒收敛**：访问、刷新、列举、容量淘汰前都会在锁内把已闲置的 `ACTIVE` 会话
-  收敛为 `IDLE_TIMEOUT`，无需后台定时任务。
+- 闲置与绝对过期判定均为**懒收敛**：访问、刷新、列举、容量淘汰前都会在锁内把已失效的
+  `ACTIVE` 会话收敛为对应终态（绝对过期优先于闲置，同一把会话锁内原子完成），
+  无需后台定时任务；容量淘汰前先收敛绝对过期与闲置会话，已失效会话不占活跃容量。
 
 可配置项（`application.properties`）：
 
@@ -208,7 +237,7 @@ auth.session.idle-timeout=PT30M   # 闲置超时：期间既无访问也无刷�
 auth.session.max-per-user=5       # 单用户活跃会话数量上限，超出淘汰最久未活动者
 ```
 
-### 2.5.5 兼容范围
+### 2.5.6 兼容范围
 
 - 既有 `POST /api/auth/login|refresh|revoke` 的路径、请求体、成功与既有失败原因/状态码保持不变；
   会话治理是在其上**叠加**的一层，不改变原接口契约。
@@ -274,7 +303,7 @@ auth.session.max-per-user=5       # 单用户活跃会话数量上限，超出�
 ## 6. 测试清单
 
 ```bash
-# 运行全部测试（30 个，含并发刷新/复用检测/过期/撤销/权限/会话治理/HTTP 端到端）
+# 运行全部测试（37 个，含并发刷新/复用检测/过期/撤销/权限/会话治理/绝对过期/HTTP 端到端）
 mvn test
 ```
 
@@ -283,6 +312,7 @@ mvn test
 | `RefreshTokenTests` | 刷新轮换、旧凭证重复使用导致全链失效、级联撤销访问凭证、未知凭证原因可区分 |
 | `ConcurrentRefreshTests` | 24 线程并发刷新同一凭证：恰好一次成功、无双链、状态最终收敛；两波刷新复用 |
 | `ExpiryAndRevocationTests` | 访问凭证过期、刷新凭证过期、主动撤销后访问/刷新全部拒绝 |
+| `AbsoluteExpiryTests` | 绝对过期先到、闲置未到时：名单隐藏、访问 `SESSION_EXPIRED`、刷新 `REFRESH_TOKEN_EXPIRED`；到期边界精确一致；终态不可复活；五类拒绝原因两两可区分；并发名单/访问/刷新最终状态唯一收敛 |
 | `AccessControlTests` | 六类拒绝原因彼此可区分、角色放行、跨角色权限不足、未声明权限默认拒绝 |
 | `LoginSuppressionTests` | 失败锁定、成功清零、窗口过期恢复、并发失败计数精确、每判定必审计 |
 | `SessionGovernanceTests` | 多用户多端登录列举（无凭证/当前标记/跨用户隔离）、精确撤销即时生效且不可复活、撤销其它、闲置与绝对过期可区分、容量淘汰最久未活动且不误伤当前/在刷新会话、越权查看撤销被拒、并发撤销+刷新终态唯一收敛、混合并发计数稳定 |

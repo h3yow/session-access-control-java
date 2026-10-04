@@ -149,6 +149,14 @@ public class AuthService {
                     return AuthResult.failure(AuthOutcome.SESSION_EVICTED,
                             "session was evicted due to the active session capacity limit");
                 }
+                if (state == SessionState.EXPIRED) {
+                    // 已被其它入口（访问/名单/淘汰）懒收敛为绝对过期终态：终态不可复活，直接拒绝
+                    log.warn("refresh-denied sessionId={} username={} reason=REFRESH_TOKEN_EXPIRED expiredAt={}",
+                            chain.getSessionId(), chain.getUsername(), chain.getRefreshTokenExpiresAt());
+                    auditService.record("REFRESH", chain.getUsername(), "REFRESH_TOKEN_EXPIRED",
+                            "session already in EXPIRED terminal state sessionId=" + chain.getSessionId());
+                    return AuthResult.failure(AuthOutcome.REFRESH_TOKEN_EXPIRED, "refresh token has expired");
+                }
 
                 Instant now = clock.now();
                 // 绝对过期优先：刷新凭证的绝对到期与闲置失效必须可区分

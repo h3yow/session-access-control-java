@@ -43,6 +43,11 @@ public final class TestFixtures {
     }
 
     public static Harness newHarness(Duration idleTimeout, int maxSessionsPerUser) {
+        return newHarness(idleTimeout, maxSessionsPerUser, REFRESH_TTL);
+    }
+
+    /** 允许测试自定义刷新凭证绝对有效期，便于构造"绝对过期先于闲置"的场景。 */
+    public static Harness newHarness(Duration idleTimeout, int maxSessionsPerUser, Duration refreshTtl) {
         MutableTickClock clock = new MutableTickClock(Instant.parse("2026-09-23T00:00:00Z"));
         SessionRepository sessionRepository = new SessionRepository();
         UserDirectory userDirectory = new UserDirectory();
@@ -57,7 +62,7 @@ public final class TestFixtures {
         TokenIssuer tokenIssuer = new TokenIssuer();
         AuditService auditService = new AuditService(clock);
         AuthService authService = new AuthService(sessionRepository, userDirectory, passwordHasher,
-                failureTracker, tokenIssuer, clock, auditService, ACCESS_TTL, REFRESH_TTL,
+                failureTracker, tokenIssuer, clock, auditService, ACCESS_TTL, refreshTtl,
                 idleTimeout, maxSessionsPerUser);
         AccessControlService accessControlService =
                 new AccessControlService(sessionRepository, userDirectory, clock, auditService, idleTimeout);
